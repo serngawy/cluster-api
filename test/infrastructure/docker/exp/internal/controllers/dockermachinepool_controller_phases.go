@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/blang/semver/v4"
 	"github.com/pkg/errors"
@@ -38,6 +39,9 @@ import (
 	infraexpv1 "sigs.k8s.io/cluster-api/test/infrastructure/docker/exp/api/v1beta1"
 	"sigs.k8s.io/cluster-api/test/infrastructure/docker/internal/docker"
 	"sigs.k8s.io/cluster-api/test/infrastructure/kind"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/labels/format"
@@ -63,7 +67,7 @@ func (r *DockerMachinePoolReconciler) reconcileDockerContainers(ctx context.Cont
 	matchingMachineCount := len(machinesMatchingInfrastructureSpec(ctx, machines, machinePool, dockerMachinePool))
 	numToCreate := int(*machinePool.Spec.Replicas) - matchingMachineCount
 	for range numToCreate {
-		log.V(2).Info("Creating a new Docker container for machinePool", "MachinePool", klog.KObj(machinePool))
+		log.Info("Creating a new Docker container for machinePool", "MachinePool", klog.KObj(machinePool))
 		name := fmt.Sprintf("worker-%s", util.RandomString(6))
 		if err := createDockerContainer(ctx, name, cluster, machinePool, dockerMachinePool); err != nil {
 			return errors.Wrap(err, "failed to create a new docker machine")
@@ -115,7 +119,7 @@ func createDockerContainer(ctx context.Context, name string, cluster *clusterv1.
 func (r *DockerMachinePoolReconciler) reconcileDockerMachines(ctx context.Context, cluster *clusterv1.Cluster, machinePool *expv1.MachinePool, dockerMachinePool *infraexpv1.DockerMachinePool) error {
 	log := ctrl.LoggerFrom(ctx)
 
-	log.V(2).Info("Reconciling DockerMachines", "DockerMachinePool", klog.KObj(dockerMachinePool))
+	log.Info("Reconciling DockerMachines", "DockerMachinePool", klog.KObj(dockerMachinePool))
 
 	dockerMachineList, err := getDockerMachines(ctx, r.Client, *cluster, *machinePool, *dockerMachinePool)
 	if err != nil {
@@ -143,8 +147,10 @@ func (r *DockerMachinePoolReconciler) reconcileDockerMachines(ctx context.Contex
 	// Create a DockerMachine for each Docker container so we surface the information to the user. Use the same name as the Docker container for the Docker Machine for ease of lookup.
 	// Providers should iterate through their infrastructure instances and ensure that each instance has a corresponding InfraMachine.
 	for _, machine := range externalMachines {
+		var desiredMachine *infrav1.DockerMachine
+
 		if existingMachine, ok := dockerMachineMap[machine.Name()]; ok {
-			log.V(2).Info("Patching existing DockerMachine", "DockerMachine", klog.KObj(&existingMachine))
+			log.Info("Patching existing DockerMachine", "DockerMachine", klog.KObj(&existingMachine))
 			desiredMachine := computeDesiredDockerMachine(machine.Name(), cluster, machinePool, dockerMachinePool, &existingMachine)
 			if err := ssa.Patch(ctx, r.Client, dockerMachinePoolControllerName, desiredMachine, ssa.WithCachingProxy{Cache: r.ssaCache, Original: &existingMachine}); err != nil {
 				return errors.Wrapf(err, "failed to update DockerMachine %q", klog.KObj(desiredMachine))
@@ -152,13 +158,44 @@ func (r *DockerMachinePoolReconciler) reconcileDockerMachines(ctx context.Contex
 
 			dockerMachineMap[desiredMachine.Name] = *desiredMachine
 		} else {
-			log.V(2).Info("Creating a new DockerMachine for Docker container", "container", machine.Name())
+			log.Info("Creating a new DockerMachine for Docker container", "container", machine.Name())
 			desiredMachine := computeDesiredDockerMachine(machine.Name(), cluster, machinePool, dockerMachinePool, nil)
 			if err := ssa.Patch(ctx, r.Client, dockerMachinePoolControllerName, desiredMachine); err != nil {
 				return errors.Wrap(err, "failed to create a new docker machine")
 			}
 
+			// // Keep trying to get the DockerMachine. This will force the cache to Create the DockerMachine.
+			// var pollErrors []error
+			// if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+			// 	//dm := &infrav1.DockerMachine{}
+			// 	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(desiredMachine), &infrav1.DockerMachine{}); err != nil {
+			// 		// Do not return error here. Continue to poll even if we hit an error
+			// 		// so that we avoid existing because of transient errors like network flakes.
+			// 		// Capture all the errors and return the aggregate error if the poll fails eventually.
+			// 		pollErrors = append(pollErrors, err)
+			// 		return false, nil
+			// 	}
+			// 	return true, nil
+			// }); err != nil {
+			// 	return errors.Wrapf(kerrors.NewAggregate(pollErrors), "failed to get the DockerMachine %s after creation", klog.KObj(desiredMachine))
+			// }
+
 			dockerMachineMap[desiredMachine.Name] = *desiredMachine
+		}
+
+		// Keep trying to get the DockerMachine. This will force the cache to Create the DockerMachine.
+		var pollErrors []error
+		if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		if err := r.Client.Get(ctx, client.ObjectKeyFromObject(desiredMachine), &infrav1.DockerMachine{}); err != nil {
+			// Do not return error here. Continue to poll even if we hit an error
+			// so that we avoid existing because of transient errors like network flakes.
+			// Capture all the errors and return the aggregate error if the poll fails eventually.
+			pollErrors = append(pollErrors, err)
+				return false, nil
+			}
+			return true, nil
+			}); err != nil {
+				return errors.Wrapf(kerrors.NewAggregate(pollErrors), "failed to get the DockerMachine %s after creation", klog.KObj(desiredMachine))
 		}
 	}
 
@@ -169,7 +206,7 @@ func (r *DockerMachinePoolReconciler) reconcileDockerMachines(ctx context.Contex
 	for _, dockerMachine := range dockerMachineMap {
 		if _, ok := externalMachineMap[dockerMachine.Name]; !ok {
 			dockerMachine := dockerMachine
-			log.V(2).Info("Deleting DockerMachine with no underlying infrastructure", "DockerMachine", klog.KObj(&dockerMachine))
+			log.Info("Deleting DockerMachine with no underlying infrastructure", "DockerMachine", klog.KObj(&dockerMachine))
 			if err := r.deleteMachinePoolMachine(ctx, dockerMachine); err != nil {
 				return err
 			}
