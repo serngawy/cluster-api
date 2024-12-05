@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/blang/semver/v4"
 	"github.com/pkg/errors"
@@ -38,6 +39,9 @@ import (
 	infraexpv1 "sigs.k8s.io/cluster-api/test/infrastructure/docker/exp/api/v1beta1"
 	"sigs.k8s.io/cluster-api/test/infrastructure/docker/internal/docker"
 	"sigs.k8s.io/cluster-api/test/infrastructure/kind"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/labels/format"
@@ -156,6 +160,22 @@ func (r *DockerMachinePoolReconciler) reconcileDockerMachines(ctx context.Contex
 			desiredMachine := computeDesiredDockerMachine(machine.Name(), cluster, machinePool, dockerMachinePool, nil)
 			if err := ssa.Patch(ctx, r.Client, dockerMachinePoolControllerName, desiredMachine); err != nil {
 				return errors.Wrap(err, "failed to create a new docker machine")
+			}
+
+			// Keep trying to get the DockerMachine. This will force the cache to Create the DockerMachine.
+			var pollErrors []error
+			if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+				//dm := &infrav1.DockerMachine{}
+				if err := r.Client.Get(ctx, client.ObjectKeyFromObject(desiredMachine), &infrav1.DockerMachine{}); err != nil {
+					// Do not return error here. Continue to poll even if we hit an error
+					// so that we avoid existing because of transient errors like network flakes.
+					// Capture all the errors and return the aggregate error if the poll fails eventually.
+					pollErrors = append(pollErrors, err)
+					return false, nil
+				}
+				return true, nil
+			}); err != nil {
+				return errors.Wrapf(kerrors.NewAggregate(pollErrors), "failed to get the DockerMachine %s after creation", klog.KObj(desiredMachine))
 			}
 
 			dockerMachineMap[desiredMachine.Name] = *desiredMachine
